@@ -7,10 +7,14 @@ Run:  uvicorn main:app --reload
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -50,6 +54,34 @@ app = FastAPI(title="Sarkari Saathi")
 
 def headers() -> dict:
     return {"api-subscription-key": KEY}
+
+
+# ---------------------------------------------------------------- audio helper
+def _ffmpeg_exe() -> str | None:
+    try:
+        import imageio_ffmpeg  # bundles an ffmpeg binary, no system install needed
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def to_wav(audio: bytes) -> bytes:
+    """Convert any browser recording (webm/ogg/mp4) to 16 kHz mono WAV, which Sarvam accepts."""
+    exe = _ffmpeg_exe()
+    if not exe:
+        raise HTTPException(500, "Audio converter (ffmpeg) is not available on the server.")
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = Path(d) / "in.bin", Path(d) / "out.wav"
+        src.write_bytes(audio)
+        p = subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+             "-ac", "1", "-ar", "16000", "-f", "wav", str(dst)],
+            capture_output=True, timeout=60,
+        )
+        if p.returncode != 0 or not dst.exists():
+            log.warning("ffmpeg failed: %s", p.stderr.decode(errors="ignore")[:300])
+            raise HTTPException(400, "Could not read the recording. Please try again or type your question.")
+        return dst.read_bytes()
 
 
 # ---------------------------------------------------------------- Sarvam calls
@@ -211,9 +243,9 @@ async def ask(
         data = await audio.read()
         if len(data) < 800:
             raise HTTPException(400, "Recording is too short. Please hold the mic and speak.")
-        transcript, detected = await speech_to_text(
-            data, audio.filename or "voice.webm", audio.content_type or "audio/webm"
-        )
+        if not (data[:4] == b"RIFF" and data[8:12] == b"WAVE"):
+            data = await asyncio.to_thread(to_wav, data)  # webm/ogg/mp4 -> 16 kHz mono WAV
+        transcript, detected = await speech_to_text(data, "voice.wav", "audio/wav")
         lang = lang or detected
     lang = lang or DEFAULT_LANG
 
